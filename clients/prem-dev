@@ -1,0 +1,2 @@
+# Client specific settings
+proxy="http://192.168.121.1:3128/"

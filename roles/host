@@ -1,0 +1,32 @@
+# -*- mode: bash -*-
+# vi: set ft=bash :
+
+# Role based init
+init_role() {
+  disk_size="4G"
+  hostname="host"
+
+  # basic pkgs
+  pkgs="neovim file lshw pciutils wget iproute2 less"
+
+  # cloud-init needed for azure
+  #pkgs="$pks cloud-init walinuxagent"
+
+  # good to have pkgs
+  if [ "$os" == "ubuntu" ]; then
+    pkgs="$pkgs fzf fd-find silversearcher-ag"
+  elif [ "$os" == "arch" ]; then
+    pkgs="$pkgs fzf fd the_silver_searcher"
+  else
+    die "Unsupported OS"
+  fi
+
+  primary_users="admin"
+  additional_users=""
+  default_password="host"
+  passwordless_sudo=1
+  passwordless_login=1  # for ttyS0 (serial console)
+  built_by="Prem Anand [ hprem@proton.me ]"
+
+  archive_dir=/space/disk
+}

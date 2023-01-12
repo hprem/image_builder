@@ -1,0 +1,671 @@
+#!/usr/bin/env bash
+set -e
+
+source_libs() {
+  # Load needed libs
+  echo "Sourcing needed libs"
+  base_dir=$(dirname $(dirname $0))
+  source $base_dir/lib/init
+  source $base_dir/lib/pda
+}
+
+init_vars() {
+  # Init default vars
+  os="ubuntu"
+  size="4G"
+  dev="/dev/nbd0"
+  fmt="qcow2"
+
+  efi_part_size="100M"
+  extra_pkgs=""
+  archive_dir=""
+  cache_dir='./cache/'
+  built_by="Image Builder"
+  provider="libvirt"
+
+  primary_users="admin"
+  additional_users=""
+  default_password=''
+
+  pkgs=""
+}
+
+# Usage
+usage() {
+  pda::usage $0 "os" "version:ubuntu version" "role" "size:disk size:4G" \
+                "fmt:output format:qcow2|box" "provider:box provider:libvirt|virtualbox" \
+                "archive"
+  pda::example $0 "--os ubuntu" "--version list" "--version 22.04 --role host" \
+                  "--version 22.04 --role frr --fmt box --archive" \
+                  "--version 22.04 --role frr --fmt box --provider virtualbox" \
+                  "--version 22.04 --role frr --fmt qcow2,vhd,box --provider libvirt --archive"
+  exit 1
+}
+
+check_root() {
+  # Check if we are root
+  [[ "$EUID" > 0 ]] && die "Please run as root"
+}
+
+main() {
+  echo "Starting image creation"
+  source_libs
+
+  # show usage if help is requested
+  echo "$*" | grep -- '-h' && usage
+
+  # Check if we are root
+  check_root
+
+  # Set default vars and parse cli args
+  init_vars
+  echo "$@"
+  pda::parse_cli_args $@ || die "Parsing cli args failed"
+
+  # Redirect logs
+  mkdir -p logs
+  exec > >(tee -a "logs/$os.log") 2>&1
+
+  # Source OS lib
+  [ -f "$base_dir/os/$os" ] || die "OS: $os not yet supported"
+  source "$base_dir/os/$os"
+
+  # List supported versions if needed
+  [ "$version" == "list" ] && die "Supported versions:\n$(get_supported_versions)"
+
+  # Source role specific info
+  invoke_for_role() {
+    local func=$1
+
+    # Find all parents for a role
+    if [ -z ${all_roles+x} ]; then
+      cur_role="$role"
+      all_roles="$role"
+      while parent_role=$(grep '^source.*/roles/' $base_dir/roles/$cur_role | grep -Po '(?<=/roles/).*'); do
+        all_roles="$all_roles $parent_role"
+        echo "all_roles: $all_roles"
+        cur_role=$parent_role
+      done
+
+      # reverse roles to get porents first
+      all_roles=$(echo $all_roles | xargs -n1 | tac | xargs)
+    fi
+
+    step "Invoking ${func}_role"
+    for cur_role in $all_roles; do
+      unset -f ${func}_role
+      source $base_dir/roles/$cur_role
+      if [[ $(type -t ${func}_role ) == function ]]; then
+        echo "Invoking ${func}_role for role:$cur_role"
+        ${func}_role
+      fi
+    done
+  }
+
+  init_roles() { invoke_for_role init; }
+  setup_roles() { invoke_for_role setup; }
+  cleanup_roles() { invoke_for_role cleanup; }
+  customize_roles() { invoke_for_role customize; }
+
+  if [ -n "$role" ]; then
+    source $base_dir/roles/$role || die "No valid role file found for role:$role"
+    [ -f $base_dir/roles/$os.$role ] && source $base_dir/roles/$os.$role || true
+    [ -n "$name" ] || name="$role"
+  fi
+  [ -n "$name" ] || name="$os"
+
+  # Source client specific info
+  client="$base_dir/clients/$(hostname)"
+  [ -f "$client" ] && source $client
+
+  # Include open-vm-tools pkg for vmware image
+  if echo $provider | grep -q "vmware"; then
+    pkgs="$pkgs open-vm-tools"
+  fi
+
+  # Start build
+  start_build
+}
+
+cleanup() {
+  [ -d "${root}" ] || return
+
+  # Clean up
+  step "Cleaning up"
+
+  # Cleanup for this role
+  cleanup_roles || die "Cleaning up rootfs for role:$role had failed"
+
+  if [ -n "${root}" ]; then
+    echo "Unmounting mounts from $root ..."
+    for dir in boot/efi $pkg_cache cache dev/pts proc sys dev; do
+        echo "    unmounting /$dir"
+        mountpoint -q "${root}/$dir" && umount "${root}/$dir"
+    done
+    mount | grep "${root}"
+    mountpoint -q "${root}" && umount "${root}"
+    rmdir "${root}"
+  fi
+
+  # Remove dirs we created
+  rm -rf /cache /roles
+
+  # Freeup nbd device
+  echo "Detaching qcow2 disk"
+  pgrep -f "qemu-nbd.*${dev}" && qemu-nbd -d "$dev" || true
+}
+
+start_build() {
+  # Start
+  check_dependencies
+  init
+  download_rootfs_if_needed
+  create_disk
+  create_partitions
+  format_partitions
+  mount_partitions
+  populate_rootfs
+  customize_rootfs || die "customize_rootfs had failed"
+  cleanup
+  post_process
+}
+
+# Util functions
+check_dependencies() {
+    step "Checking dependencies"
+    for pkg in wget kmod gdisk qemu-utils jq; do
+        dpkg-query -W $pkg &>/dev/null || apt-get -y install $pkg
+    done
+
+    # Load nbd module
+    lsmod | grep -q nbd || modprobe nbd max_part=16
+
+    # Check if nbd0 is free
+    pgrep -f "qemu-nbd.*nbd0" && die "Device /dev/nbd0 is not free" || true
+}
+
+init() {
+  init_roles
+}
+
+set_disk_name() {
+  [ -n "$role" ] && disk="${role}.${version}.qcow2" || disk="${name}.${version}.qcow2"
+}
+
+create_disk() {
+    # set disk name
+    set_disk_name
+
+    step "Creating a new disk: $disk"
+    qemu-img create -f qcow2 $disk $size || die "Creating a blank disk failed"
+    echo
+
+    # Mount disk
+    [ -d $ROOT ] || mkdir -p $ROOT
+    step "Attaching the disk to nbd dev"
+    qemu-nbd -c ${dev} $disk || die "Attaching the disk $disk to nbd dev $dev failed"
+}
+
+create_partitions() {
+    [ -n "$dev" ] || die "Cannot find disk device"
+
+    (
+        echo o      # Create a new empty GPT partition table
+        echo y      # Proceed
+        echo n      # Add a new partition (efi)
+        echo 1      # Partition number
+        echo        # First sector (Accept default)
+        echo +${efi_part_size} # Last sector or size
+        echo ef00   # Partition code for "EFI System"
+        echo n      # Add a new partition (ext4 for rootfs)
+        echo 2      # Partition number
+        echo        # First sector (Accept default)
+        echo        # Last sector
+        echo 8300   # Partition code for "Linux filesystem"
+        echo c      # Change name
+        echo 2      # Partition number
+        echo Root   # Name
+        echo p      # Print partition table
+        echo w      # Write changes
+        echo y      # Proceed
+    ) | gdisk "${dev}"
+}
+
+format_partitions() {
+  step "Formatting partitions"
+  [ -n "$dev" ] || die "Cannot find disk device"
+
+  # Create efi filesystem on 1st partition
+  efi_part="${dev}p1"
+  echo "Creating EFI partition on $efi_part"
+  mkfs.fat -F32 -n "EFI" "$efi_part" || return 1
+  echo "Done"
+
+  # Create ext4 filesystem for root partition
+  root_part="${dev}p2"
+  echo "Creating ext4 partition on $root_part"
+  mkfs.ext4 -q -O ^64bit -L Root "$root_part" || return 1
+  echo "Done"
+}
+
+mount_partitions() {
+  step "Mounting partitions"
+  root="$(mktemp -d /tmp/diskXXXXXXX)" || die "Creating temp dir (for rootfs) failed"
+
+  # Mount the root partition and copy the contents of the ISO to it
+  [ -n "$root_part" ] || die "Cannot find root partition"
+  echo "Mounting $root_part on $root"
+  mount "$root_part" "$root" || die "Mounting rootfs failed"
+  echo "Done"
+}
+
+download_rootfs_if_needed() {
+    step "Downloading rootfs"
+    [ -n "$rootfs" ] || "Rootfs not set"
+    [ -f "$rootfs" ] && echo "Rootfs ($rootfs) already exists" || download_rootfs
+}
+
+populate_rootfs() {
+    # Untar rootfs contents
+    step "Populating rootfs"
+    echo "Untaring rootfs contents into root partition"
+    extract_rootfs || die "Populating rootfs failed"
+    tar xf $rootfs -C $root --numeric-owner || die "Populating rootfs failed"
+    echo "Done"
+}
+
+setup_mounts() {
+  step "Setting up mounts"
+  for dir in dev proc sys dev/pts; do
+    echo "Mounting $dir"
+    mkdir -p "${root}/${dir}"
+    mount -o bind /$dir "${root}/${dir}"
+  done
+
+  # Bind mount the cache dir that contains apt metadata and deb files
+  pkg_cache_dir="$cache_dir/$(basename $pkg_cache)"
+  [ -d $pkg_cache_dir ] || mkdir -p $pkg_cache_dir
+  mkdir -p ${root}/$pkg_cache
+  echo "Mounting $pkg_cache"
+  mount --bind $pkg_cache_dir ${root}/$pkg_cache
+  echo "Mounting cache"
+  mkdir -p $cache_dir/$os ${root}/cache
+  mount --bind $cache_dir/$os ${root}/cache
+
+  local efi="/boot/efi"
+  mkdir -p "${root}/${efi}"
+  [ -n "$efi_part" ] || die "EFI Partion not found"
+  echo "Mounting efi"
+  mount "$efi_part" "${root}/${efi}" || die "Mounting efi partition had failed"
+  echo Done
+}
+
+setup_rootfs() {
+  # Setup mounts
+  setup_mounts
+
+  # Copy any useful file into the mounts
+  echo "Copying useful things into root partition"
+  cp $base_dir/share/$os.logo "${root}/etc/logo.txt" ;# for banner generation
+  figlet -f small ${name^} > "${root}/etc/banner.txt"
+  cp /etc/resolv.conf $root/etc/resolv.conf      ;# to ensure dns can work inside chroot
+
+  # Perform any setup needed for this role
+  setup_roles || die "Setting up rootfs for role:$role had failed"
+  cp -r roles "${root}/"
+
+  # TODO: Remove later: fzf pkg doesn't have /usr/share/doc/fzf/examples/key-bindings.bash
+  if echo $pkgs | grep -q fzf; then
+    mkdir -p $root/usr/share/doc/fzf/examples/
+    cp /usr/share/doc/fzf/examples/key-bindings.bash $root/usr/share/doc/fzf/examples/key-bindings.bash
+  fi
+
+  # sync filesystem
+  sync
+}
+
+customize_rootfs() {
+    # Setup mounts
+    setup_rootfs
+
+    # Perform chroot and then customize
+    step "Customizing the image"
+    export -f die chroot_exec install_pkgs setup_system customize_roles install_bootloader cleanup_system
+    export -f get_kernel get_initrd def_cleanup reset_err_handlers bash_exit invoke_for_role step
+    export base_dir os role hostname primary_users additional_users default_password pkgs extra_pkgs built_by proxy ssh_key
+
+    ls $root/bin/bash
+    #read -p "Press Enter to cont ..."
+    chroot $root /bin/bash -ex <<'    EOF' || die "chroot failed"
+      chroot_exec
+    EOF
+}
+
+chroot_exec() {
+  export DEBIAN_FRONTEND=noninteractive
+  base_dir="/"
+
+  cleanup() { cleanup_system; }
+
+  install_pkgs || die "Installing pkgs had failed"
+  setup_system || die "Setting up system had failed"
+  customize_roles || die "Customizing the image for role:$role had failed"
+  install_bootloader || die "Installing bootloader had failed"
+  cleanup_system || die "Cleaning up system had failed"
+
+  echo "Exiting chroot"
+}
+
+setup_system() {
+    step "Setting up system"
+    # Create fstab
+    cat << '    EOF' | sed 's/^    //' > /etc/fstab
+    # <file system> <mount point>   <type>  <options>      <dump>   <pass>
+    LABEL=Root       /          ext4    errors=remount-ro     0       1
+    LABEL=EFI        /boot/efi  vfat    umask=0077            0       1
+    EOF
+
+    # Hostname
+    echo ${hostname} > /etc/hostname
+    echo -e "127.0.0.1\tlocalhost $hostname"  > /etc/hosts
+
+    # Create user account
+    password="${default_password}"
+    [ -n "$password" ] || password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 8)
+    local users="$primary_users $additional_users"
+    for user in $users; do
+      useradd -s '/bin/bash' -m $user
+      chmod 755 /home/$user
+      echo -e "${password}\n${password}" | passwd $user
+
+      if [ -n "$ssh_key" ]; then
+        mkdir -p /home/$user/.ssh/
+        echo ${ssh_key} > /home/$user/.ssh/authorized_keys
+        chown $user:$user /home/$user/.ssh
+      fi
+
+      # Disable sudo related msg at logon
+      touch /home/$user/.sudo_as_admin_successful
+    done
+
+    # Passwordless sudo for all primary users
+    for user in $primary_users; do
+      usermod -aG sudo $user
+      echo "$user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$user
+    done
+
+    # Passwordless login
+    user="${primary_users/ */}"
+    sed -i "s|/sbin/agetty|/sbin/agetty -a $user|" /lib/systemd/system/serial-getty@.service /lib/systemd/system/getty@.service
+    sed -i '0,/^$/!b;//a\# passwordless login for ttyS0\nauth sufficient pam_listfile.so item=tty sense=allow file=/etc/securetty onerr=fail apply=__user__\n' /etc/pam.d/login
+    sed -i "s/__user__/$user/" /etc/pam.d/login
+    echo -e "tty1\nttyS0" > /etc/securetty
+
+    # Enable dhcp on first intf
+    cat << '    EOF' | sed 's/^    //' > /etc/systemd/network/01-mgmt.link
+    [Match]
+    Name=en*
+    Property=IFINDEX=2
+
+    [Link]
+    Name=mgmt0
+    EOF
+
+    cat << '    EOF' | sed 's/^    //' > /etc/systemd/network/01-mgmt.network
+    [Match]
+    Name=mgmt0
+
+    [Network]
+    DHCP=ipv4
+
+    [DHCP]
+    UseDomains=true
+    EOF
+
+    # Enable serial console
+    systemctl enable serial-getty@ttyS0
+
+    # Enable systemd services
+    systemctl enable systemd-networkd
+    systemctl enable systemd-resolved
+
+    # Resolve.conf
+    echo "Setting up resolve.conf"
+    rm -rf /etc/resolv.conf
+    ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+    # Make dnsmasq to cope with systemd-resolved
+    [ -f /etc/dnsmasq.conf ] && sed -i "s/^#bind-interfaces/bind-interfaces/g" /etc/dnsmasq.conf
+
+     # Bashrc
+    echo "Customizing bashrc"
+    echo -e "\n# Aliases\nalias x='exit'\nalias jctl='sudo journalctl'" >> /home/$user/.bashrc
+    # FZF
+    if [ ! -f /usr/share/fzf/key-bindings.bash ] && [ -f /usr/share/doc/fzf/examples/key-bindings.bash ]; then
+      mkdir -p /usr/share/fzf/
+      cp /usr/share/doc/fzf/examples/key-bindings.bash /usr/share/fzf/key-bindings.bash
+    fi
+    echo -e "\n# fzf - fuzzy finder\nsource /usr/share/fzf/key-bindings.bash" >> /home/$user/.bashrc
+
+    # Banner
+    source /etc/os-release
+    [ -n "$VERSION_ID" ] || VERSION_ID="$IMAGE_VERSION" # For arch
+    rm -rf /etc/update-motd.d/[!0]* /lib/systemd/system/motd* || pass
+    center() { local width=$1; local margin=$(( ($width - $(echo "$2" | head -n1 | wc -c))/2 )); echo "$2" | sed "s/^/$(printf ' %.0s' $(seq 1 $margin))/"; }
+    if [ -f /etc/banner.txt ] && [ -f /etc/logo.txt ]; then
+      local banner="$(cat /etc/banner.txt)"
+      # paste banner and logo side by side
+      paste -d' ' <(sed "s/VV.ID/$VERSION_ID/" /etc/logo.txt) <(echo -e "\n"; center 40 "$banner"; echo;  center 40 "Built by Graphiant QA" ) >> /etc/motd
+      rm -rf /etc/logo.txt /etc/banner.txt
+    else
+      (center 80 "$role"; center 80 "Built by $built_by") >> /etc/motd
+    fi
+
+    # Azure
+    if [ -n "$azure" ]; then
+    #if dpkg -l | grep -q walinuxagent; then
+      sed -i 's/Provisioning.Enabled=y/Provisioning.Enabled=n/g' /etc/waagent.conf
+      sed -i 's/Provisioning.UseCloudInit=y/Provisioning.UseCloudInit=n/g' /etc/waagent.conf
+      sed -i 's/Extensions.Enabled=y/Extensions.Enabled=n/g' /etc/waagent.conf
+      sed -i 's/ResourceDisk.Format=y/ResourceDisk.Format=n/g' /etc/waagent.conf
+
+      cat << '      EOF' | sed 's/^      //' >> /etc/waagent.conf
+
+      # For Azure Linux agent version >= 2.2.45, this is the option to configure,
+      # enable, or disable the provisioning behavior of the Linux agent.
+      # Accepted values are auto (default), waagent, cloud-init, or disabled.
+      # A value of auto means that the agent will rely on cloud-init to handle
+      # provisioning if it is installed and enabled, which in this case it will.
+      Provisioning.Agent=auto
+      EOF
+    fi
+}
+
+install_bootloader() {
+  step "Installing bootloader"
+  bootctl install || die "Installing boot manager into EFI system partition failed"
+  bootctl status
+  [ "$(bootctl is-installed)" == "yes" ] || "Installing boot manager had failed"
+
+  # Move kernel and initrd files into EFI system partition
+  echo "Moving kernel and initrd files into EFI system partition"
+  local kernel=$(get_kernel)
+  local initrd=$(get_initrd)
+  mkdir -p /boot/efi/loader/entries/$os
+  mv /boot/$kernel /boot/$initrd /boot/efi/loader/entries/$os
+  rm -rf /boot/vmlinuz* /boot/init*
+
+  # Loader conf
+  echo "Customizing boot loader config"
+  cat | sed 's/^    //' > /boot/efi/loader/loader.conf << __EOF
+  timeout 1
+  console-mode auto
+  default $os
+  editor yes
+__EOF
+
+  source /etc/os-release
+  [ -n "$VERSION" ] || VERSION="$IMAGE_VERSION" # For arch
+  cat | sed 's/^    //' > /boot/efi/loader/entries/$os.conf << __EOF
+  title   $NAME $VERSION
+  linux   /loader/entries/$os/$kernel
+  initrd  /loader/entries/$os/$initrd
+  options root=LABEL=Root ro console=tty0 console=ttyS0,115200n8 quiet systemd.show_status=1
+__EOF
+
+  echo "Bootloader installed successfully"
+  echo
+}
+
+compress_disk() {
+  [ -n "${skip_compress}" ] && return
+  [ -n "$disk" ] || die "Disk not found"
+
+  step "Compressing disk"
+  guestfish --rw -a $disk << '  EOF' || die "Squeezing disk failed"
+    run
+    glob zerofree /dev/[sv]da[2-9]*
+    quit
+  EOF
+
+  mv $disk $disk.bak
+  qemu-img convert -f qcow2 -O qcow2 -c $disk.bak $disk
+  read s1 s2 <<< $(du -sh $disk.bak $disk  | cut -f1 | xargs)
+  echo "Squeezed and compressed disk size from $s1 to $s2"
+  rm -rf $disk.bak
+}
+
+convert_disk() {
+  [ -n "${skip_convert}" ] && return
+  [ "$fmt" == 'qcow2' ] && return
+
+  step "Converting disk to needed fmt"
+  fmt_list=$fmt
+  for fmt in $(echo $fmt_list | tr ',' ' ' | xargs); do
+    echo "Converting disk to $fmt fmt"
+    if [ "$fmt" == 'qcow2' ]; then
+      # Nothing to do
+      :
+    elif [ "$fmt" == 'box' ]; then
+      provider_list=$provider
+      for provider in $(echo $provider_list | tr ',' ' ' | xargs); do
+        convert_to_box $provider
+      done
+    elif [ "$fmt" == 'vhd' ]; then
+      convert_to_vhd
+    else
+      die "Unsupported format: $fmt. Has to be qcow2 or vhd or box"
+    fi
+  done
+}
+
+convert_to_vhd() {
+  vhd=${disk/.qcow2/.vhd}
+
+  # Fix size (but avoid modifying original disk)
+  echo "Resizing qcow2 before converting it into vhd image"
+  cp $disk $disk.tmp
+  size=$(qemu-img info --output json "$disk.tmp" | jq '."virtual-size"')
+  MB=$((1024*1024))
+  rounded_size=$(((($size+$MB-1)/$MB)*$MB))
+  qemu-img resize $disk.tmp $rounded_size
+
+  # Generate vhd image
+  echo "Creating vhd disk image"
+  qemu-img convert -f qcow2 -O vpc -o subformat=fixed,force_size $disk.tmp $vhd
+  rm -rf $disk.tmp
+
+  # VHD image is uncompressed. compress it
+  echo "compressing vhd disk image"
+  gzip -f $vhd
+}
+
+convert_to_box() {
+  echo "Format: $fmt Provider: $provider"
+  rm -rf box
+  mkdir -p box
+
+  format='qcow2'
+  ovf=''
+  box_img="box.img"
+  if [ "$provider" == 'virtualbox' ]; then
+      format='vmdk'
+      cp $base_dir/share/vbox.ovf box/box.ovf
+      ovf="box.ovf"
+      box_img="box.vmdk"
+  fi
+
+  cat << __EOL | sed 's/^  //' > box/metadata.json
+  {
+    "provider"     : "$provider",
+    "format"       : "$format",
+    "virtual_size" : ${size/G/}
+  }
+__EOL
+
+  if [ "$provider" == 'virtualbox' ]; then
+    cat << '    EOL' | sed 's/^      //' > box/Vagrantfile
+      Vagrant.configure("2") do |config|
+        config.vm.provider :virtualbox do |vb|
+          vb.default_nic_type = "virtio"
+
+          vb.memory = "1024M"
+          vb.cpus = 1
+
+          vb.check_guest_additions = false
+          vb.customize ['modifyvm', :id, '--firmware', 'efi']
+        end
+      end  
+    EOL
+  elif [ "$provider" == 'libvirt' ]; then
+    cat << '    EOL' | sed 's/^      //' > box/Vagrantfile
+      Vagrant.configure("2") do |config|
+        config.vm.provider :libvirt do |libvirt|
+          libvirt.driver = "kvm"
+          libvirt.connect_via_ssh = false
+
+          libvirt.machine_type = "q35"
+          libvirt.loader = "/usr/share/qemu/OVMF.fd"
+        end
+      end
+    EOL
+  elif [ "$provider" == 'vmware' ]; then
+    cat << '    EOL' > box/Vagrantfile
+    Vagrant.configure("2") do |config|
+      config.vm.provider :vmware_esxi do |esxi|
+        esxi.guest_username = 'vagrant'
+        esxi.guest_nic_type = 'vmxnet3'
+      end
+    end
+    EOL
+  else
+    die "Unknown provider"
+  fi
+
+  box=${disk/.qcow2/.box}
+  [ "$provider" == 'virtualbox' ] && box=${disk/.qcow2/.vmware.box}
+  cp $disk box/${box_img}
+  tar cvzf $box -C box metadata.json Vagrantfile $box_img $ovf
+}
+
+archive_disk() {
+  [ -n "$archive" ] || return
+  [ -n "$disk" ] || die "Disk not found"
+
+  step "Archiving disk"
+  [ ! -d "${archive_dir}" ] && echo "Archive dir not specified. Skipped archiving disk" && return
+
+  dest="${archive_dir}/$os/$role/$version/"
+  mkdir -p "$dest"
+  cp -v ${disk%.*}.* "$dest"
+  chmod 664 $dest/${disk%.*}.*
+}
+
+post_process() {
+  compress_disk
+  convert_disk
+  archive_disk
+}
+
+# Invoke main, if script is not sourced
+[ "${BASH_SOURCE[0]}" = "${0}" ] && main $@ || SOURCED=1

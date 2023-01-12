@@ -1,0 +1,14 @@
+# rootfs
+*.tar.gz
+
+# Images
+*.qcow2
+*.box
+*.vhd
+*.vhd.gz
+
+# Logs
+logs/
+
+# Cache
+cache/

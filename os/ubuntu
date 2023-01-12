@@ -1,0 +1,81 @@
+version=22.10
+ubuntu_url="https://cdimage.ubuntu.com/ubuntu-base/releases/"
+rootfs="ubuntu-base-${version}-base-amd64.tar.gz"
+pkg_cache='/var/cache/apt'
+
+get_supported_versions() {
+  wget -q $ubuntu_url -O - | grep -oP '(?<=href=")[.0-9]+(?=/")'
+}
+
+download_rootfs() {
+  wget "https://cdimage.ubuntu.com/ubuntu-base/releases/$version/release/$rootfs"
+}
+
+extract_rootfs() {
+  tar xf $rootfs -C $root --numeric-owner
+}
+
+get_kernel() {
+  local kernel="$(basename $(ls /boot/vmlinuz-*))"
+  [ -n "$kernel" ] || die "Kernel ($kernel) not found"
+  echo $kernel
+}
+
+get_initrd() {
+  local initrd="$(basename $(ls /boot/initrd.img-*))"
+  [ -n "$initrd" ] || die "Initrd ($initrd) not found"
+  echo $initrd
+}
+install_pkgs() {
+  source /etc/os-release
+  release=$UBUNTU_CODENAME
+
+  # Create apt sources.list file
+  mv /etc/apt/sources.list{,.orig}
+  echo "deb http://archive.ubuntu.com/ubuntu/ $release main universe" > /etc/apt/sources.list
+  echo "deb http://archive.ubuntu.com/ubuntu/ $release-updates main universe" >> /etc/apt/sources.list
+
+  # Setup http_proxy if needed
+  [ -n "$proxy" ] && export http_proxy="$proxy"
+
+  # Update apt cache
+  apt update || die "apt update failed"
+
+  # Install systemd
+  apt-get -y install systemd systemd-sysv systemd-boot polkitd sudo kmod locales dbus openssh-server || die "Installing mandatory packages failed"
+
+  # Install any other useful pkgs
+  apt-get -y install --no-install-recommends $pkgs $extra_pkgs || die "Installing user specified packages failed"
+
+  # Install kernel and initramfs-tools
+  kernel="linux-image-virtual"
+  [ -n "$azure" ] && kernel="linux-image-azure linux-azure"
+  apt-get -y install --no-install-recommends $kernel initramfs-tools || die "Installing linux kernel failed"
+
+  # Misc pkgs
+  ## Azure needs walinuxagent
+  #[ -n "azure" ] && apt-get -y install --no-install-recommends walinuxagent
+}
+
+cleanup_system() {
+  # Use a simple apt sources.list
+  echo "deb http://archive.ubuntu.com/ubuntu/ $release main" > /etc/apt/sources.list
+
+  # Cleanup
+  apt -y autoremove
+  rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/*.log
+  rm -rf /usr/share/man/* /usr/share/info/* /usr/share/lintian/overrides/*
+  find /usr/share/doc -depth -type f ! -name copyright -delete
+  find /usr/share/doc -empty -delete
+
+  # Remove machine-id
+  echo > /etc/machine-id
+  echo > /var/lib/dbus/machine-id
+
+  # disable bracketed-paste mode (enabled by readline)
+  echo 'set enable-bracketed-paste off' >> /etc/inputrc
+
+  echo
+}
+
+# vim:syntax=sh filetype=sh
