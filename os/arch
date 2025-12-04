@@ -1,0 +1,78 @@
+version="latest"
+arch_url="https://geo.mirror.pkgbuild.com/iso"
+rootfs=$(curl -s $arch_url/$version/ | grep -oP 'archlinux-bootstrap-[^"]*-x86_64.tar.gz(?=<)')
+pkg_cache='/var/cache/pacman'
+
+get_supported_versions() {
+  wget -q $arch_url -O - | grep -oP '(?<=")[0-9][0-9.]*(?=/")'
+}
+
+download_rootfs() {
+  echo "Downloading rootfs: $rootfs"
+  set -x
+  url="$arch_url/$version/$rootfs"
+  wget -q "$url" || die "Download failed: url: $url"
+}
+
+extract_rootfs() {
+  tar xf $rootfs -C $root --numeric-owner --strip-components=1 root.x86_64
+}
+
+get_kernel() {
+  local kernel=vmlinuz-linux
+  [ -f /boot/$kernel ] || die "Kernel ($kernel) not found"
+  echo $kernel
+}
+
+get_initrd() {
+  local initrd=initramfs-linux.img
+  [ -f /boot/$initrd ] || die "Initrd ($initrd) not found"
+  echo $initrd
+}
+
+install_pkgs() {
+  # Setup http_proxy if needed
+  [ -n "$proxy" ] && export http_proxy="$proxy"
+
+  # Update
+  ## Enable worldwide mirrors in pacman's mirror list
+  sed -i -e '/Worldwide/,/^$/{//!s/^#//' -e '}' /etc/pacman.d/mirrorlist
+  ## Populate key
+  pacman-key --init
+  pacman-key --populate archlinux
+  ## Create /etc/pacman.d/mirrorlist
+  pacman --noconfirm -S reflector
+  reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+  pacman --noconfirm -Rns reflector
+
+  # Update pkgs
+  pacman --noconfirm -Syu || die "pkg update failed"
+
+  # Install systemd
+  pacman --noconfirm -S systemd systemd-sysvcompat sudo kmod dbus openssh || die "Installing mandatory packages failed"
+
+  # Install any other useful pkgs
+  pacman --noconfirm -S $pkgs $extra_pkgs || die "Installing user specified packages failed"
+
+  # Install kernel and initramfs-tools
+  pacman --noconfirm -S linux mkinitcpio || die "Installing linux kernel failed"
+}
+
+cleanup_system() {
+  # pacman-key --populate starts gpg-agent
+  pkill gpg-agent
+
+  # Cleanup
+  rm -rf /var/log/*.log
+  rm -rf /usr/share/man/* /usr/share/info/* /usr/share/lintian/overrides/*
+  find /usr/share/doc -depth -type f ! -name copyright -delete
+  find /usr/share/doc -empty -delete
+
+  # Remove machine-id
+  echo > /etc/machine-id
+  echo > /var/lib/dbus/machine-id
+
+  echo
+}
+
+# vim:syntax=sh filetype=sh

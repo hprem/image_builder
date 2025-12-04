@@ -1,0 +1,14 @@
+# -*- mode: bash -*-
+# vi: set ft=bash :
+
+disk_size="4G"
+hostname="minimal"
+
+passwordless_sudo=1
+passwordless_login=1  # for ttyS0 (serial console)
+built_by="prem@graphiant.com"
+
+ssh_key="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCyHG3UQZk5Ub8jYUhBJ/QAevKWkLKw31kI+OsetpVKYAs0d8U4o4k7SpGqfkUCpbCRxpCzZvs/wr9l/FW6A7Bro7/3OemmEl3bjg/0zA/ZQ9LrxFAvdmB3Pffexl9JOL9lGRV+XobNO99TKa9ePNYf5+Y4zAcLA4URjGjfW/RNrGfJiy/R2BY7mc1LYaIpzsaKC8rhVkv4gqgGgPD7Q/6wxkb7UUZSfistogdqTDq7faWMKTX4sN4tU13CiuEhR75PHFi1Vc1sT7WtcwvpC0m2zC1JRXYRAHMoQ57Z6guLq4KDFR5HOp+pOGMmDqNZJrwTpvXo1N5U4Jsv3JnyYZld hprem@lvn-svr-1"
+
+#skip_compress=true
+#skip_convert=true
