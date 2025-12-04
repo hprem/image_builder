@@ -5,8 +5,9 @@ source_libs() {
   # Load needed libs
   echo "Sourcing needed libs"
   base_dir=$(dirname $(dirname $0))
-  source $base_dir/lib/init
-  source $base_dir/lib/pda
+  echo "    Base dir: $base_dir"
+  echo "    -- lib/init" && source $base_dir/lib/init
+  echo "    -- lib/pda" && source $base_dir/lib/pda
 }
 
 init_vars() {
@@ -59,16 +60,18 @@ main() {
 
   # Set default vars and parse cli args
   init_vars
-  echo "$@"
   pda::parse_cli_args $@ || die "Parsing cli args failed"
 
   # Redirect logs
   mkdir -p logs
-  exec > >(tee -a "logs/$os.log") 2>&1
+  [ -f "logs/$role.$os.2.log" ] && mv "logs/$role.$os.2.log" "logs/$role.$os.3.log"
+  [ -f "logs/$role.$os.1.log" ] && mv "logs/$role.$os.1.log" "logs/$role.$os.2.log"
+  [ -f "logs/$role.$os.log" ]   && mv "logs/$role.$os.log" "logs/$role.$os.1.log";
+  exec > >(tee "logs/$role.$os.log") 2>&1
 
   # Source OS lib
   [ -f "$base_dir/os/$os" ] || die "OS: $os not yet supported"
-  source "$base_dir/os/$os"
+  source "$base_dir/os/$os" || die "Syntax error in os/$os"
 
   # List supported versions if needed
   [ "$version" == "list" ] && die "Supported versions:\n$(get_supported_versions)"
@@ -81,7 +84,7 @@ main() {
     if [ -z ${all_roles+x} ]; then
       cur_role="$role"
       all_roles="$role"
-      while parent_role=$(grep '^source.*/roles/' $base_dir/roles/$cur_role | grep -Po '(?<=/roles/).*'); do
+      while parent_role=$(grep '^source .*' $role_dir/$cur_role | grep role_dir | grep -Po '(?<=/).*'); do
         all_roles="$all_roles $parent_role"
         echo "all_roles: $all_roles"
         cur_role=$parent_role
@@ -94,10 +97,12 @@ main() {
     step "Invoking ${func}_role"
     for cur_role in $all_roles; do
       unset -f ${func}_role
-      source $base_dir/roles/$cur_role
+      source $role_dir/$cur_role || die "Syntax error in roles/$cur_role"
       if [[ $(type -t ${func}_role ) == function ]]; then
-        echo "Invoking ${func}_role for role:$cur_role"
+        echo "  -- Invoking ${func}_role for role:$cur_role"
         ${func}_role
+      else
+        echo "   Hook '${func}_role' not defined for role:$cur_role. Ignoring..."
       fi
     done
   }
@@ -108,8 +113,11 @@ main() {
   customize_roles() { invoke_for_role customize; }
 
   if [ -n "$role" ]; then
-    source $base_dir/roles/$role || die "No valid role file found for role:$role"
-    [ -f $base_dir/roles/$os.$role ] && source $base_dir/roles/$os.$role || true
+    role_dir=$base_dir/roles
+    [ -d "$base_dir/../roles" ] && role_dir=$base_dir/../roles
+    [ -f "$role_dir/$role" ] || die "No valid role file found for role:$role"
+    source "$role_dir/$role" || die "Sourcing role file for role:$role had failed"
+    [ -f "$role_dir/$os.$role" ] && source "$role_dir/$os.$role" || true
     [ -n "$name" ] || name="$role"
   fi
   [ -n "$name" ] || name="$os"
@@ -128,10 +136,15 @@ main() {
 }
 
 cleanup() {
-  [ -d "${root}" ] || return
+  if [ ! -d "${root}" ]; then
+    cleanup_nbd
+    echo "Skipping cleanup as root dir was not created"
+    return
+  fi
 
   # Clean up
   step "Cleaning up"
+  #read -p "Proceed with cleanup? "
 
   # Cleanup for this role
   cleanup_roles || die "Cleaning up rootfs for role:$role had failed"
@@ -151,8 +164,12 @@ cleanup() {
   rm -rf /cache /roles
 
   # Freeup nbd device
+  cleanup_nbd
+}
+
+cleanup_nbd() {
   echo "Detaching qcow2 disk"
-  pgrep -f "qemu-nbd.*${dev}" && qemu-nbd -d "$dev" || true
+  pgrep -f "qemu-nbd.*${dev}" >/dev/null && qemu-nbd -d "$dev" || true
 }
 
 start_build() {
@@ -185,6 +202,10 @@ check_dependencies() {
 }
 
 init() {
+  # cleanup if needed
+  root=$(mount | grep /dev/nbd0p2 | awk '{print $3}')
+  [ -n "$root" ] && [[ "$root" =~ ^/tmp/disk ]] && cleanup
+
   init_roles
 }
 
@@ -238,13 +259,13 @@ format_partitions() {
   # Create efi filesystem on 1st partition
   efi_part="${dev}p1"
   echo "Creating EFI partition on $efi_part"
-  mkfs.fat -F32 -n "EFI" "$efi_part" || return 1
+  mkfs.fat -F32 -n "EFI" "$efi_part" || die "Failed to create efi partition"
   echo "Done"
 
   # Create ext4 filesystem for root partition
   root_part="${dev}p2"
   echo "Creating ext4 partition on $root_part"
-  mkfs.ext4 -q -O ^64bit -L Root "$root_part" || return 1
+  mkfs.ext4 -q -O ^64bit -L Root "$root_part" || die "Failed to create ext4 partition"
   echo "Done"
 }
 
@@ -294,6 +315,7 @@ setup_mounts() {
 
   local efi="/boot/efi"
   mkdir -p "${root}/${efi}"
+  chmod 700 "${root}/${efi}"
   [ -n "$efi_part" ] || die "EFI Partion not found"
   echo "Mounting efi"
   mount "$efi_part" "${root}/${efi}" || die "Mounting efi partition had failed"
@@ -312,13 +334,18 @@ setup_rootfs() {
 
   # Perform any setup needed for this role
   setup_roles || die "Setting up rootfs for role:$role had failed"
-  cp -r roles "${root}/"
+  cp -Hr $role_dir "${root}/roles"
 
   # TODO: Remove later: fzf pkg doesn't have /usr/share/doc/fzf/examples/key-bindings.bash
   if echo $pkgs | grep -q fzf; then
     mkdir -p $root/usr/share/doc/fzf/examples/
     cp /usr/share/doc/fzf/examples/key-bindings.bash $root/usr/share/doc/fzf/examples/key-bindings.bash
   fi
+
+  # Setup nvim
+  mkdir -p $root/etc/xdg/nvim/
+  cp $base_dir/share/init.vim $root/etc/xdg/nvim/
+  ln -s init.vim $root/etc/xdg/nvim/sysinit.vim
 
   # sync filesystem
   sync
@@ -332,7 +359,7 @@ customize_rootfs() {
     step "Customizing the image"
     export -f die chroot_exec install_pkgs setup_system customize_roles install_bootloader cleanup_system
     export -f get_kernel get_initrd def_cleanup reset_err_handlers bash_exit invoke_for_role step
-    export base_dir os role hostname primary_users additional_users default_password pkgs extra_pkgs built_by proxy ssh_key
+    export base_dir role_dir os role hostname primary_users additional_users default_password pkgs extra_pkgs built_by proxy ssh_key kernel_cmdline_args
 
     ls $root/bin/bash
     #read -p "Press Enter to cont ..."
@@ -343,7 +370,7 @@ customize_rootfs() {
 
 chroot_exec() {
   export DEBIAN_FRONTEND=noninteractive
-  base_dir="/"
+  base_dir="/"; role_dir=/roles
 
   cleanup() { cleanup_system; }
 
@@ -388,6 +415,12 @@ setup_system() {
       touch /home/$user/.sudo_as_admin_successful
     done
 
+    # Setup nvim
+    mkdir -p /etc/xdg/nvim/
+    wget -qP "/etc/xdg/nvim/colors" https://raw.githubusercontent.com/joshdick/onedark.vim/main/colors/onedark.vim
+    wget -qP "/etc/xdg/nvim/autoload" https://raw.githubusercontent.com/joshdick/onedark.vim/main/autoload/onedark.vim
+    wget -qP "/etc/xdg/nvim/site/autoload/" https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+
     # Passwordless sudo for all primary users
     for user in $primary_users; do
       usermod -aG sudo $user
@@ -409,6 +442,7 @@ setup_system() {
 
     [Link]
     Name=mgmt0
+    AlternativeName=eth0
     EOF
 
     cat << '    EOF' | sed 's/^    //' > /etc/systemd/network/01-mgmt.network
@@ -439,13 +473,20 @@ setup_system() {
 
      # Bashrc
     echo "Customizing bashrc"
-    echo -e "\n# Aliases\nalias x='exit'\nalias jctl='sudo journalctl'" >> /home/$user/.bashrc
+    [ -f /home/$user/.bashrc ] || cp /etc/skel/.bashrc /home/$user/.bashrc
+    [ -f /home/$user/.profile ] || cp /etc/skel/.profile /home/$user/.profile
+    sed -i 's/#force_color_prompt=yes/force_color_prompt=yes/' /home/$user/.bashrc
+    echo -e "\n# Include local bin in PATH\nexport PATH=~/.local/bin:\$PATH" >> /home/$user/.bashrc
+    echo -e "alias x='exit'\nalias jctl='sudo journalctl'" >> /home/$user/.bash_aliases
+
     # FZF
     if [ ! -f /usr/share/fzf/key-bindings.bash ] && [ -f /usr/share/doc/fzf/examples/key-bindings.bash ]; then
       mkdir -p /usr/share/fzf/
       cp /usr/share/doc/fzf/examples/key-bindings.bash /usr/share/fzf/key-bindings.bash
     fi
-    echo -e "\n# fzf - fuzzy finder\nsource /usr/share/fzf/key-bindings.bash" >> /home/$user/.bashrc
+    if [ -f /usr/share/fzf/key-bindings.bash ]; then
+      echo -e "\n# fzf - fuzzy finder\nsource /usr/share/fzf/key-bindings.bash" >> /home/$user/.bashrc
+    fi
 
     # Banner
     source /etc/os-release
@@ -479,13 +520,22 @@ setup_system() {
       Provisioning.Agent=auto
       EOF
     fi
+
+    # Ensure all files are used by the user, just in case
+    chown -R $user:$user /home/$user/
 }
 
 install_bootloader() {
+  #local kernel=$(get_kernel)
+  #update-initramfs -u -k $kernel
+
   step "Installing bootloader"
-  bootctl install || die "Installing boot manager into EFI system partition failed"
-  bootctl status
+  bootctl --make-entry-directory=no install || die "Installing boot manager into EFI system partition failed"
   [ "$(bootctl is-installed)" == "yes" ] || "Installing boot manager had failed"
+  #rm -rf /boot/efi/loader/entries/*.conf
+  ls /boot/efi/
+  find /boot/efi/ -maxdepth 1 -mindepth 1 | grep -v EFI | xargs rm -rf
+  ls /boot/efi/
 
   # Move kernel and initrd files into EFI system partition
   echo "Moving kernel and initrd files into EFI system partition"
@@ -510,9 +560,10 @@ __EOF
   title   $NAME $VERSION
   linux   /loader/entries/$os/$kernel
   initrd  /loader/entries/$os/$initrd
-  options root=LABEL=Root ro console=tty0 console=ttyS0,115200n8 quiet systemd.show_status=1
+  options root=LABEL=Root ro console=tty0 console=ttyS0,115200n8 quiet systemd.show_status=1 $kernel_cmdline_args
 __EOF
 
+  bootctl status
   echo "Bootloader installed successfully"
   echo
 }
@@ -646,6 +697,7 @@ __EOL
   [ "$provider" == 'virtualbox' ] && box=${disk/.qcow2/.vmware.box}
   cp $disk box/${box_img}
   tar cvzf $box -C box metadata.json Vagrantfile $box_img $ovf
+  rm -rf box
 }
 
 archive_disk() {

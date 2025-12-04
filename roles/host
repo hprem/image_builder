@@ -7,16 +7,16 @@ init_role() {
   hostname="host"
 
   # basic pkgs
-  pkgs="neovim file lshw pciutils wget iproute2 less"
+  pkgs="neovim file lshw pciutils wget iproute2 less wget curl"
 
   # cloud-init needed for azure
   #pkgs="$pks cloud-init walinuxagent"
 
   # good to have pkgs
   if [ "$os" == "ubuntu" ]; then
-    pkgs="$pkgs fzf fd-find silversearcher-ag"
+    pkgs="$pkgs fzf fd-find ripgrep"
   elif [ "$os" == "arch" ]; then
-    pkgs="$pkgs fzf fd the_silver_searcher"
+    pkgs="$pkgs fzf fd ripgrep"
   else
     die "Unsupported OS"
   fi
@@ -29,4 +29,11 @@ init_role() {
   built_by="Prem Anand [ hprem@proton.me ]"
 
   archive_dir=/space/disk
+}
+
+# Role based customization
+# Will get invoked within a chrooted env
+customize_role() {
+  user="${primary_users/ */}"
+  echo -e "alias fd='fdfind'" >> /home/$user/.bash_aliases
 }

@@ -19,7 +19,7 @@ def_cleanup() {
 bash_exit() {
   # Exit only if we are running non-interactively
   [ "$SOURCED" = "1" ] && echo "Exiting ..." && set +e && return 0
-  [ -z "$PS1" ] && exit || set +e
+  [ -z "$PS1" ] && exit 1 || set +e
 }
 
 # Init color support
